@@ -1,0 +1,31 @@
+name: Media Agent (Daily Calendar)
+
+on:
+  schedule:
+    - cron: "0 11 * * *" # todo dia 11:00 UTC (08:00 em SP)
+  workflow_dispatch: {}
+
+jobs:
+  build-calendar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run agent
+        env:
+          GSHEETS_SERVICE_ACCOUNT_JSON: ${{ secrets.GSHEETS_SERVICE_ACCOUNT_JSON }}
+          GSHEETS_SPREADSHEET_ID: ${{ secrets.GSHEETS_SPREADSHEET_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DEFAULT_OBJECTIVE: ${{ secrets.DEFAULT_OBJECTIVE }}
+        run: |
+          python -m agent.run
