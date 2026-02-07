@@ -36,5 +36,6 @@ Depois, faça autocheck rápido e revise o texto para:
 - evitar juridiquês
 - evitar promessas
 
-RETORNE APENAS JSON VÁLIDO (uma lista com 3 objetos), sem texto extra.
+RETORNE APENAS UM JSON VÁLIDO (uma lista com 3 objetos) e nada mais.
+NÃO use markdown, NÃO use ```json, NÃO inclua explicações fora do JSON.
 """
