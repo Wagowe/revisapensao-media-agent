@@ -61,3 +61,107 @@ def _write_mock_rows(spreadsheet_id: str, objective: str, note: str):
             "Você pode ter direito ao recálculo.",
             "Roteiro (MOCK): 1) Mostre o erro comum (pós EC 2019). "
             "2) Diga quem se encaixa (dependente inválido/PCD). "
+            "3) CTA: triagem gratuita + WhatsApp.",
+            "Cortaram 40%? Pode estar errado.",
+            "Legenda (MOCK): Se o dependente é inválido/PCD, o INSS pode ter calculado errado. "
+            "Faça a triagem gratuita e entenda seu caso.",
+            "Triagem gratuita no link.",
+            "Assets: card simples + ícones (sem logos)",
+            "mock",
+            note,
+        ],
+        [
+            today, objective, "prova_social", "carousel",
+            "MOCK: antes/depois do recálculo",
+            "Olha o antes/depois",
+            "Caso real: valor pode subir bastante.",
+            "Roteiro (MOCK): Slide 1 promessa, 2 contexto, 3 erro do INSS, "
+            "4 tese/como corrigir, 5 CTA triagem.",
+            "ANTES x DEPOIS",
+            "Legenda (MOCK): Mostre o contraste e convide para triagem. "
+            "Se você tem pensão com dependente inválido/PCD, vale revisar.",
+            "Agende a consulta.",
+            "Assets: gráfico simples + print borrado",
+            "mock",
+            note,
+        ],
+        [
+            today, objective, "triagem", "stories",
+            "MOCK: triagem gratuita em 30s",
+            "Quer saber se seu caso é forte?",
+            "Responda 6 perguntas.",
+            "Roteiro (MOCK): Story 1 promessa, Story 2 quem se encaixa, "
+            "Story 3 CTA com link/WhatsApp.",
+            "Triagem grátis",
+            "Legenda (MOCK): Triagem gratuita → envia documentos → consulta.",
+            "Arraste/Link na bio.",
+            "Assets: 3 cards minimalistas",
+            "mock",
+            note,
+        ],
+    ]
+
+    append_rows(spreadsheet_id, "calendar", rows)
+
+
+def main():
+    spreadsheet_id = os.environ["GSHEETS_SPREADSHEET_ID"]
+    objective = os.getenv("DEFAULT_OBJECTIVE", "balanced").lower()
+
+    calendar_rows, swipe_rows, perf_rows = build_context(spreadsheet_id, n=250)
+    today = str(date.today())
+
+    def row_status(r):
+        return r[12] if len(r) > 12 else ""
+
+    # ✅ Gate: se já tem DRAFT hoje, não gera de novo.
+    # (blocked/mock não bloqueiam — você pode tentar de novo mais tarde)
+    already_drafted_today = any(
+        len(r) > 0 and r[0] == today and row_status(r) == "draft"
+        for r in calendar_rows
+    )
+    if already_drafted_today:
+        print("Already generated drafts today. Skipping Gemini call.")
+        return
+
+    prompt = make_master_prompt(objective, calendar_rows, swipe_rows, perf_rows)
+
+    try:
+        raw = gemini_generate(prompt)
+        ideas = _safe_json_loads(raw)
+    except Exception as e:
+        msg = str(e)
+        print(f"LLM failed. Error: {msg}")
+
+        # ✅ Mock apenas para 429
+        if "HTTP 429" in msg or " 429 " in msg or "429" in msg:
+            _write_mock_rows(spreadsheet_id, objective, f"fallback_mock_due_to_429: {msg}")
+            return
+
+        _write_blocked_row(spreadsheet_id, objective, msg)
+        return
+
+    rows = []
+    for item in ideas[:3]:
+        rows.append([
+            today,
+            objective,
+            item.get("pillar", ""),
+            item.get("format", ""),
+            item.get("idea_title", ""),
+            item.get("hook", ""),
+            item.get("hook_alt", ""),
+            item.get("script", ""),
+            item.get("on_screen_text", ""),
+            item.get("caption", ""),
+            item.get("cta", ""),
+            item.get("assets_needed", ""),
+            "draft",
+            "",
+        ])
+
+    append_rows(spreadsheet_id, "calendar", rows)
+
+
+if __name__ == "__main__":
+    main()
