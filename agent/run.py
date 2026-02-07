@@ -35,7 +35,7 @@ def _write_blocked_row(spreadsheet_id: str, objective: str, error_msg: str):
         objective,
         "system",
         "n/a",
-        "LLM indisponível hoje (quota/rate limit)",
+        "LLM indisponível hoje",
         "—",
         "—",
         f"Falhou ao gerar conteúdo via Gemini. Motivo: {short_err}",
@@ -49,59 +49,15 @@ def _write_blocked_row(spreadsheet_id: str, objective: str, error_msg: str):
     append_rows(spreadsheet_id, "calendar", [row])
 
 
-def main():
-    spreadsheet_id = os.environ["GSHEETS_SPREADSHEET_ID"]
-    objective = os.getenv("DEFAULT_OBJECTIVE", "balanced").lower()
-
-    # lê histórico (aumentei p/ 250 só pra garantir que “hoje” esteja no range)
-    calendar_rows, swipe_rows, perf_rows = build_context(spreadsheet_id, n=250)
-
+def _write_mock_rows(spreadsheet_id: str, objective: str, note: str):
     today = str(date.today())
+    note = _sanitize_err(note)
 
-    def row_status(r):
-        return r[12] if len(r) > 12 else ""
-
-    # ✅ Gate automático: se já existe saída hoje (draft ou blocked), NÃO chama Gemini
-    already_ran_today = any(
-        len(r) > 0 and r[0] == today and row_status(r) == "draft"
-        for r in calendar_rows
-    )
-
-    if already_ran_today:
-        print("Already produced output today (draft/blocked). Skipping Gemini call.")
-        return
-
-    prompt = make_master_prompt(objective, calendar_rows, swipe_rows, perf_rows)
-
-    try:
-        raw = gemini_generate(prompt)
-        ideas = _safe_json_loads(raw)
-    except Exception as e:
-        print(f"LLM failed; writing blocked row to Sheets. Error: {e}")
-        _write_blocked_row(spreadsheet_id, objective, str(e))
-        return
-
-    rows = []
-    for item in ideas[:3]:
-        rows.append([
-            today,
-            objective,
-            item.get("pillar", ""),
-            item.get("format", ""),
-            item.get("idea_title", ""),
-            item.get("hook", ""),
-            item.get("hook_alt", ""),
-            item.get("script", ""),
-            item.get("on_screen_text", ""),
-            item.get("caption", ""),
-            item.get("cta", ""),
-            item.get("assets_needed", ""),
-            "draft",
-            "",
-        ])
-
-    append_rows(spreadsheet_id, "calendar", rows)
-
-
-if __name__ == "__main__":
-    main()
+    rows = [
+        [
+            today, objective, "educacao", "reels",
+            "MOCK: revisão da pensão em 15s",
+            "Seu INSS cortou 40% da pensão?",
+            "Você pode ter direito ao recálculo.",
+            "Roteiro (MOCK): 1) Mostre o erro comum (pós EC 2019). "
+            "2) Diga quem se encaixa (dependente inválido/PCD). "
