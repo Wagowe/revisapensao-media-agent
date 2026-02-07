@@ -1,6 +1,6 @@
 import os
 import json
-from datetime import date
+from datetime import datetime
 
 from agent.context import build_context
 from agent.llm import gemini_generate
@@ -27,11 +27,11 @@ def _sanitize_err(msg: str) -> str:
 
 
 def _write_blocked_row(spreadsheet_id: str, objective: str, error_msg: str):
-    today = str(date.today())
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     short_err = _sanitize_err(error_msg)
 
     row = [
-        today,
+        ts,
         objective,
         "system",
         "n/a",
@@ -50,12 +50,12 @@ def _write_blocked_row(spreadsheet_id: str, objective: str, error_msg: str):
 
 
 def _write_mock_rows(spreadsheet_id: str, objective: str, note: str):
-    today = str(date.today())
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     note = _sanitize_err(note)
 
     rows = [
         [
-            today, objective, "educacao", "reels",
+            ts, objective, "educacao", "reels",
             "MOCK: revisão da pensão em 15s",
             "Seu INSS cortou 40% da pensão?",
             "Você pode ter direito ao recálculo.",
@@ -71,7 +71,7 @@ def _write_mock_rows(spreadsheet_id: str, objective: str, note: str):
             note,
         ],
         [
-            today, objective, "prova_social", "carousel",
+            ts, objective, "prova_social", "carousel",
             "MOCK: antes/depois do recálculo",
             "Olha o antes/depois",
             "Caso real: valor pode subir bastante.",
@@ -86,7 +86,7 @@ def _write_mock_rows(spreadsheet_id: str, objective: str, note: str):
             note,
         ],
         [
-            today, objective, "triagem", "stories",
+            ts, objective, "triagem", "stories",
             "MOCK: triagem gratuita em 30s",
             "Quer saber se seu caso é forte?",
             "Responda 6 perguntas.",
