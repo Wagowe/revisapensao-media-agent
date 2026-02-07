@@ -7,24 +7,31 @@ from agent.llm import gemini_generate
 from agent.sheets import append_rows
 from agent.prompts_dynamic import make_master_prompt
 
+
 def _safe_json_loads(text: str):
     # Tenta extrair o primeiro bloco JSON se o modelo “escapar”
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
+    s = (text or "").strip()
+
+    # Remove fences comuns
+    if s.startswith("```"):
+        s = s.replace("```json", "").replace("```", "").strip()
+
     # Procura primeiro '[' e último ']'
-    start = text.find("[")
-    end = text.rfind("]")
+    start = s.find("[")
+    end = s.rfind("]")
     if start != -1 and end != -1 and end > start:
-        text = text[start:end+1]
-    return json.loads(text)
+        s = s[start:end + 1]
+
+    return json.loads(s)
+
 
 def main():
-    service_json = os.environ["GSHEETS_SERVICE_ACCOUNT_JSON"]
+    # WIF/ADC: não usamos mais JSON de service account
     spreadsheet_id = os.environ["GSHEETS_SPREADSHEET_ID"]
     objective = os.getenv("DEFAULT_OBJECTIVE", "balanced").lower()
 
-    calendar_rows, swipe_rows, perf_rows = build_context(service_json, spreadsheet_id, n=50)
+    # Lê contexto direto do Sheets via credenciais default (WIF)
+    calendar_rows, swipe_rows, perf_rows = build_context(spreadsheet_id, n=50)
     prompt = make_master_prompt(objective, calendar_rows, swipe_rows, perf_rows)
 
     raw = gemini_generate(prompt)
@@ -33,7 +40,8 @@ def main():
     today = str(date.today())
     rows = []
 
-    for item in ideas:
+    # Esperado: 3 itens (reels + carousel + stories). Se vier mais, truncamos.
+    for item in ideas[:3]:
         rows.append([
             today,
             objective,
@@ -51,7 +59,9 @@ def main():
             ""
         ])
 
-    append_rows(service_json, spreadsheet_id, "calendar", rows)
+    # WIF/ADC: append_rows não recebe mais service_json
+    append_rows(spreadsheet_id, "calendar", rows)
+
 
 if __name__ == "__main__":
     main()
