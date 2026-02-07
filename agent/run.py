@@ -24,7 +24,7 @@ def _safe_json_loads(text: str):
 
 def _write_blocked_row(spreadsheet_id: str, objective: str, error_msg: str):
     today = str(date.today())
-    short_err = (error_msg or "LLM error")[:400]
+    short_err = (error_msg or "LLM error").replace("key=", "key=REDACTED")[:400]
 
     row = [
         today,
