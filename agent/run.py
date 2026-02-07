@@ -25,17 +25,45 @@ def _safe_json_loads(text: str):
     return json.loads(s)
 
 
+def _write_blocked_row(spreadsheet_id: str, objective: str, error_msg: str):
+    today = str(date.today())
+    # Limita tamanho do erro pra não estourar célula
+    short_err = (error_msg or "LLM error")[:400]
+
+    rows = [[
+        today,
+        objective,
+        "system",
+        "n/a",
+        "LLM indisponível hoje (quota/rate limit)",
+        "—",
+        "—",
+        f"Falhou ao gerar conteúdo via Gemini. Motivo: {short_err}",
+        "—",
+        "Sem conteúdo gerado hoje.",
+        "Tentar novamente mais tarde.",
+        "Nenhum",
+        "blocked",
+        short_err
+    ]]
+
+    append_rows(spreadsheet_id, "calendar", rows)
+
+
 def main():
-    # WIF/ADC: não usamos mais JSON de service account
     spreadsheet_id = os.environ["GSHEETS_SPREADSHEET_ID"]
     objective = os.getenv("DEFAULT_OBJECTIVE", "balanced").lower()
 
-    # Lê contexto direto do Sheets via credenciais default (WIF)
     calendar_rows, swipe_rows, perf_rows = build_context(spreadsheet_id, n=50)
     prompt = make_master_prompt(objective, calendar_rows, swipe_rows, perf_rows)
 
-    raw = gemini_generate(prompt)
-    ideas = _safe_json_loads(raw)
+    try:
+        raw = gemini_generate(prompt)
+        ideas = _safe_json_loads(raw)
+    except Exception as e:
+        print(f"LLM failed; writing blocked row to Sheets. Error: {e}")
+        _write_blocked_row(spreadsheet_id, objective, str(e))
+        return
 
     today = str(date.today())
     rows = []
@@ -50,18 +78,4 @@ def main():
             item.get("idea_title", ""),
             item.get("hook", ""),
             item.get("hook_alt", ""),
-            item.get("script", ""),
-            item.get("on_screen_text", ""),
-            item.get("caption", ""),
-            item.get("cta", ""),
-            item.get("assets_needed", ""),
-            "draft",
-            ""
-        ])
-
-    # WIF/ADC: append_rows não recebe mais service_json
-    append_rows(spreadsheet_id, "calendar", rows)
-
-
-if __name__ == "__main__":
-    main()
+            item.get("script", ""
