@@ -9,14 +9,11 @@ from agent.prompts_dynamic import make_master_prompt
 
 
 def _safe_json_loads(text: str):
-    # Tenta extrair o primeiro bloco JSON se o modelo “escapar”
     s = (text or "").strip()
 
-    # Remove fences comuns
     if s.startswith("```"):
         s = s.replace("```json", "").replace("```", "").strip()
 
-    # Procura primeiro '[' e último ']'
     start = s.find("[")
     end = s.rfind("]")
     if start != -1 and end != -1 and end > start:
@@ -27,10 +24,9 @@ def _safe_json_loads(text: str):
 
 def _write_blocked_row(spreadsheet_id: str, objective: str, error_msg: str):
     today = str(date.today())
-    # Limita tamanho do erro pra não estourar célula
     short_err = (error_msg or "LLM error")[:400]
 
-    rows = [[
+    row = [
         today,
         objective,
         "system",
@@ -44,10 +40,10 @@ def _write_blocked_row(spreadsheet_id: str, objective: str, error_msg: str):
         "Tentar novamente mais tarde.",
         "Nenhum",
         "blocked",
-        short_err
-    ]]
+        short_err,
+    ]
 
-    append_rows(spreadsheet_id, "calendar", rows)
+    append_rows(spreadsheet_id, "calendar", [row])
 
 
 def main():
@@ -68,7 +64,6 @@ def main():
     today = str(date.today())
     rows = []
 
-    # Esperado: 3 itens (reels + carousel + stories). Se vier mais, truncamos.
     for item in ideas[:3]:
         rows.append([
             today,
@@ -78,4 +73,17 @@ def main():
             item.get("idea_title", ""),
             item.get("hook", ""),
             item.get("hook_alt", ""),
-            item.get("script", ""
+            item.get("script", ""),
+            item.get("on_screen_text", ""),
+            item.get("caption", ""),
+            item.get("cta", ""),
+            item.get("assets_needed", ""),
+            "draft",
+            "",
+        ])
+
+    append_rows(spreadsheet_id, "calendar", rows)
+
+
+if __name__ == "__main__":
+    main()
