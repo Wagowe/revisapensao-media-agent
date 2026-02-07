@@ -109,7 +109,7 @@ def main():
     objective = os.getenv("DEFAULT_OBJECTIVE", "balanced").lower()
 
     calendar_rows, swipe_rows, perf_rows = build_context(spreadsheet_id, n=250)
-    today = str(date.today())
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def row_status(r):
         return r[12] if len(r) > 12 else ""
@@ -117,7 +117,7 @@ def main():
     # ✅ Gate: se já tem DRAFT hoje, não gera de novo.
     # (blocked/mock não bloqueiam — você pode tentar de novo mais tarde)
     already_drafted_today = any(
-        len(r) > 0 and r[0] == today and row_status(r) == "draft"
+        len(r) > 0 and r[0] == ts and row_status(r) == "draft"
         for r in calendar_rows
     )
     if already_drafted_today:
@@ -144,7 +144,7 @@ def main():
     rows = []
     for item in ideas[:3]:
         rows.append([
-            today,
+            ts,
             objective,
             item.get("pillar", ""),
             item.get("format", ""),
