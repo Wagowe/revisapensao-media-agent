@@ -5,12 +5,21 @@ on:
     - cron: "0 11 * * *" # todo dia 11:00 UTC (08:00 em SP)
   workflow_dispatch: {}
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   build-calendar:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Auth to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -23,9 +32,9 @@ jobs:
 
       - name: Run agent
         env:
-          GSHEETS_SERVICE_ACCOUNT_JSON: ${{ secrets.GSHEETS_SERVICE_ACCOUNT_JSON }}
           GSHEETS_SPREADSHEET_ID: ${{ secrets.GSHEETS_SPREADSHEET_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DEFAULT_OBJECTIVE: ${{ secrets.DEFAULT_OBJECTIVE }}
         run: |
           python -m agent.run
+
