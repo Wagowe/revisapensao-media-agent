@@ -63,7 +63,7 @@ def main():
 
     # ✅ Gate automático: se já existe saída hoje (draft ou blocked), NÃO chama Gemini
     already_ran_today = any(
-        len(r) > 0 and r[0] == today and row_status(r) in {"draft", "blocked"}
+        len(r) > 0 and r[0] == today and row_status(r) == "draft"
         for r in calendar_rows
     )
 
