@@ -9,6 +9,10 @@ permissions:
   contents: read
   id-token: write
 
+concurrency:
+  group: revisapensao-media-agent
+  cancel-in-progress: true
+
 jobs:
   build-calendar:
     runs-on: ubuntu-latest
