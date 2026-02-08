@@ -1,12 +1,12 @@
 import os
 import time
 import random
+import json
 import requests
 
 BASE = "https://generativelanguage.googleapis.com/v1beta"
 RETRY_STATUS = {429, 500, 502, 503, 504}
 
-# Preferir modelos mais leves/menos concorridos (se aparecerem no ListModels)
 PREFERRED = [
     "models/gemini-2.5-flash-lite",
     "models/gemini-2.0-flash-lite",
@@ -57,21 +57,19 @@ def _list_models(api_key: str) -> list[str]:
     return [m.get("name") for m in models if m.get("name")]
 
 def _rank_models(available: list[str]) -> list[str]:
-    """
-    Ordena modelos: preferidos primeiro (na ordem PREFERRED),
-    depois os demais (ordem original).
-    """
     avail_set = set(available)
     ranked = [m for m in PREFERRED if m in avail_set]
     ranked += [m for m in available if m not in ranked]
     return ranked
 
 def _make_payload(prompt: str) -> dict:
+    # Menos criatividade → mais conformidade com JSON
+    # Menos tokens → menos chance de truncar e quebrar JSON
     return {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
-            "temperature": 0.7,
-            "maxOutputTokens": 750,  # ↓ reduz custo/risco de 429
+            "temperature": 0.3,
+            "maxOutputTokens": 450,
             "response_mime_type": "application/json",
             "response_json_schema": IDEAS_SCHEMA,
         },
@@ -87,6 +85,38 @@ def _sleep_backoff(base_delay: float, attempt: int, headers: dict):
     print(f"Sleeping {delay:.1f}s")
     time.sleep(delay)
 
+def _extract_json_text(data: dict) -> str:
+    """
+    Extrai o texto do candidato. Em JSON mode, isso deveria ser um JSON válido.
+    Mesmo assim, às vezes pode vir com lixo/truncado. Tentamos extrair o bloco
+    [ ... ] de forma conservadora.
+    """
+    txt = data["candidates"][0]["content"]["parts"][0]["text"]
+    if not isinstance(txt, str):
+        raise ValueError("Model response text is not a string")
+
+    s = txt.strip()
+
+    # Tenta como JSON direto
+    try:
+        json.loads(s)
+        return s
+    except Exception:
+        pass
+
+    # Tenta extrair apenas o array (conservador)
+    start = s.find("[")
+    end = s.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        candidate = s[start:end + 1].strip()
+        # valida
+        json.loads(candidate)
+        return candidate
+
+    # Se não der, joga erro com um recorte (sem vazar secrets)
+    snippet = s[:220].replace("key=", "key=REDACTED")
+    raise ValueError(f"BAD_JSON_TEXT: could not parse/repair. Snippet: {snippet}")
+
 def gemini_generate(prompt: str) -> str:
     key = os.environ["GEMINI_API_KEY"]
     available = _list_models(key)
@@ -97,7 +127,6 @@ def gemini_generate(prompt: str) -> str:
 
     payload = _make_payload(prompt)
 
-    # Importante: poucas tentativas por modelo evita ficar preso na mesma janela de rate-limit
     attempts_per_model = 2
     base_delay = 2.0
     last_err = None
@@ -110,17 +139,14 @@ def gemini_generate(prompt: str) -> str:
             try:
                 r = requests.post(url, json=payload, timeout=90)
 
-                # 404: modelo não serve pra generateContent nessa key → próximo modelo
                 if r.status_code == 404:
                     last_err = f"HTTP 404 on {model}"
                     print(f"{last_err} → switching model")
                     break
 
-                # 429: troca de modelo imediatamente; se acabar modelos, aí sim backoff
                 if r.status_code == 429:
                     last_err = f"HTTP 429 on {model}"
                     print(f"{last_err} → switching model")
-                    # não gasta mais tentativas nesse modelo
                     break
 
                 if r.status_code in RETRY_STATUS:
@@ -131,13 +157,14 @@ def gemini_generate(prompt: str) -> str:
 
                 r.raise_for_status()
                 data = r.json()
-                return data["candidates"][0]["content"]["parts"][0]["text"]
 
-            except requests.RequestException as e:
+                # Retorna string JSON validada (ou levanta ValueError)
+                return _extract_json_text(data)
+
+            except (requests.RequestException, ValueError, KeyError, IndexError) as e:
                 last_err = f"{type(e).__name__}: {e} on {model}"
                 print(f"{last_err}. Retry {attempt}/{attempts_per_model}")
                 _sleep_backoff(base_delay, attempt, {})
                 continue
 
-    # Se chegou aqui, falhou em todos os modelos
     raise RuntimeError(f"Gemini failed after trying {len(ranked)} model(s). Last error: {last_err}")
