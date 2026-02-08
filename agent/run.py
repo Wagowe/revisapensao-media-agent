@@ -110,7 +110,7 @@ def main():
 
     calendar_rows, swipe_rows, perf_rows = build_context(spreadsheet_id, n=250)
 
-    # "today" para gate (data apenas); "ts" para escrita (data+hora)
+    # Gate diário (data) vs escrita (timestamp)
     today = datetime.now().strftime("%Y-%m-%d")
 
     def row_status(r):
@@ -125,8 +125,7 @@ def main():
             for r in calendar_rows
         )
 
-    # ✅ Gate: se já tem DRAFT hoje, não gera de novo.
-    # (blocked/mock não bloqueiam — você pode tentar de novo mais tarde)
+    # ✅ Se já tem draft hoje, não gera de novo
     already_drafted_today = any(
         len(r) > 12 and row_date_prefix(r) == today and row_status(r) == "draft"
         for r in calendar_rows
@@ -137,45 +136,29 @@ def main():
 
     prompt = make_master_prompt(objective, calendar_rows, swipe_rows, perf_rows)
 
-   try:
-    ideas = None
-    last_parse_err = None
+    # ---- chamada do LLM + parse com retry em caso de JSON inválido ----
+    try:
+        ideas = None
+        last_parse_err = None
 
-    # tenta até 2 vezes: se vier JSON inválido, tenta de novo (pode cair em outro modelo)
-    for _ in range(2):
-        raw = gemini_generate(prompt)
-        try:
-            ideas = _safe_json_loads(raw)
-            last_parse_err = None
-            break
-        except json.JSONDecodeError as je:
-            last_parse_err = f"BAD_JSON: {je}"
-            print(f"Got invalid JSON from model. Retrying once. Error: {je}")
+        for _ in range(2):  # tenta 2 vezes no total
+            raw = gemini_generate(prompt)
+            try:
+                ideas = _safe_json_loads(raw)
+                last_parse_err = None
+                break
+            except json.JSONDecodeError as je:
+                last_parse_err = f"BAD_JSON: {je}"
+                print(f"Got invalid JSON from model. Retrying once. Error: {je}")
 
-    if ideas is None:
-        raise RuntimeError(last_parse_err or "BAD_JSON: unknown parse error")
+        if ideas is None:
+            raise RuntimeError(last_parse_err or "BAD_JSON: unknown parse error")
 
-except Exception as e:
-    msg = str(e)
-    print(f"LLM failed. Error: {msg}")
+    except Exception as e:
+        msg = str(e)
+        print(f"LLM failed. Error: {msg}")
 
-    # ✅ Mock apenas para 429 e sem duplicar no mesmo dia
-    if "HTTP 429" in msg or " 429 " in msg or "429" in msg:
-        if has_status_today("mock"):
-            print("Already wrote MOCK today. Skipping duplicate mock.")
-            return
-        _write_mock_rows(spreadsheet_id, objective, f"fallback_mock_due_to_429: {msg}")
-        return
-
-    # ✅ Blocked: evita duplicar também
-    if has_status_today("blocked"):
-        print("Already wrote BLOCKED today. Skipping duplicate blocked.")
-        return
-
-    _write_blocked_row(spreadsheet_id, objective, msg)
-    return
-
-        # ✅ Mock apenas para 429 e sem duplicar no mesmo dia
+        # ✅ Mock apenas para 429, e sem duplicar no mesmo dia
         if "HTTP 429" in msg or " 429 " in msg or "429" in msg:
             if has_status_today("mock"):
                 print("Already wrote MOCK today. Skipping duplicate mock.")
@@ -183,7 +166,7 @@ except Exception as e:
             _write_mock_rows(spreadsheet_id, objective, f"fallback_mock_due_to_429: {msg}")
             return
 
-        # ✅ Blocked: evita duplicar também (opcional, mas útil)
+        # ✅ Blocked: sem duplicar no mesmo dia
         if has_status_today("blocked"):
             print("Already wrote BLOCKED today. Skipping duplicate blocked.")
             return
@@ -191,6 +174,7 @@ except Exception as e:
         _write_blocked_row(spreadsheet_id, objective, msg)
         return
 
+    # ---- escrever drafts ----
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = []
     for item in ideas[:3]:
