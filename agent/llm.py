@@ -1,13 +1,11 @@
 import os
 import time
 import random
-import json
 import requests
 
 BASE = "https://generativelanguage.googleapis.com/v1beta"
 RETRY_STATUS = {429, 500, 502, 503, 504}
 
-# Preferência de modelos de texto
 PREFERRED = [
     "models/gemini-2.5-flash-lite",
     "models/gemini-2.0-flash-lite",
@@ -17,59 +15,16 @@ PREFERRED = [
     "models/gemini-2.5-pro",
 ]
 
-# Excluir qualquer coisa que não seja "texto padrão"
 EXCLUDE_SUBSTRINGS = [
-    "tts",
-    "audio",
-    "image",
-    "vision",
-    "embedding",
-    "robotics",
-    "computer-use",
-    "deep-research",
-    "imagen",
-    "veo",
-    "gemma",
-    "nano",
-    "aqa",
+    "tts", "audio", "image", "vision", "embedding", "robotics",
+    "computer-use", "deep-research", "imagen", "veo", "gemma",
+    "nano", "aqa",
 ]
-
-# Schema de 1 ideia (objeto)
-IDEA_SCHEMA = {
-    "type": "object",
-    "required": [
-        "pillar",
-        "format",
-        "idea_title",
-        "hook",
-        "hook_alt",
-        "script",
-        "on_screen_text",
-        "caption",
-        "cta",
-        "assets_needed",
-    ],
-    "properties": {
-        "pillar": {"type": "string"},
-        "format": {"type": "string"},
-        "idea_title": {"type": "string"},
-        "hook": {"type": "string"},
-        "hook_alt": {"type": "string"},
-        "script": {"type": "string"},
-        "on_screen_text": {"type": "string"},
-        "caption": {"type": "string"},
-        "cta": {"type": "string"},
-        "assets_needed": {"type": "string"},
-    },
-    "additionalProperties": False,
-}
-
 
 def _is_allowed_text_model(name: str) -> bool:
     n = (name or "").lower()
     if "gemini" not in n:
         return False
-    # precisa ser flash/pro (texto)
     if ("flash" not in n) and ("pro" not in n):
         return False
     for bad in EXCLUDE_SUBSTRINGS:
@@ -77,14 +32,7 @@ def _is_allowed_text_model(name: str) -> bool:
             return False
     return True
 
-
 def _list_models(api_key: str) -> list[str]:
-    """
-    Lista modelos e filtra:
-    - precisa suportar generateContent
-    - precisa parecer "Gemini texto"
-    - exclui previews/tts/audio/image/embeddings etc.
-    """
     url = f"{BASE}/models?key={api_key}"
     r = requests.get(url, timeout=30)
     r.raise_for_status()
@@ -102,31 +50,14 @@ def _list_models(api_key: str) -> list[str]:
         if not _is_allowed_text_model(name):
             continue
         out.append(name)
-
     return out
-
 
 def _rank_models(available: list[str]) -> list[str]:
     avail_set = set(available)
     ranked = [m for m in PREFERRED if m in avail_set]
     extras = [m for m in available if m not in ranked]
-    # não tente uma lista enorme — isso só queima tempo e quota
-    ranked += extras[:3]
+    ranked += extras[:2]  # não explode tempo/quota
     return ranked
-
-
-def _make_payload(prompt: str) -> dict:
-    # bem conservador: resposta curta e obediente
-    return {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.15,
-            "maxOutputTokens": 300,
-            "response_mime_type": "application/json",
-            "response_json_schema": IDEA_SCHEMA,
-        },
-    }
-
 
 def _sleep_backoff(base_delay: float, attempt: int, headers: dict):
     retry_after = headers.get("Retry-After")
@@ -138,34 +69,33 @@ def _sleep_backoff(base_delay: float, attempt: int, headers: dict):
     print(f"Sleeping {delay:.1f}s")
     time.sleep(delay)
 
+def _extract_text(data: dict) -> str:
+    """
+    Extrai texto do retorno de forma resiliente.
+    """
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise KeyError("candidates")
 
-def _extract_json_text(data: dict) -> str:
-    txt = data["candidates"][0]["content"]["parts"][0]["text"]
-    if not isinstance(txt, str):
-        raise ValueError("Model response text is not a string")
+    c0 = candidates[0] or {}
+    content = c0.get("content") or {}
+    parts = content.get("parts") or []
 
-    s = txt.strip()
+    if parts and isinstance(parts, list):
+        p0 = parts[0] or {}
+        txt = p0.get("text")
+        if isinstance(txt, str) and txt.strip():
+            return txt
 
-    # direto
-    try:
-        json.loads(s)
-        return s
-    except Exception:
-        pass
+    # Alguns retornos podem vir com 'output' ou outros campos;
+    # se não acharmos texto, reportamos motivo.
+    raise KeyError("parts")
 
-    # extrai objeto { ... }
-    start = s.find("{")
-    end = s.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        candidate = s[start:end + 1].strip()
-        json.loads(candidate)
-        return candidate
-
-    snippet = s[:260].replace("key=", "key=REDACTED")
-    raise ValueError(f"BAD_JSON_TEXT: could not parse/repair. Snippet: {snippet}")
-
-
-def gemini_generate_one(prompt: str) -> str:
+def gemini_generate_kv(prompt: str) -> str:
+    """
+    Gera texto no formato key=value (10 linhas), sem JSON mode.
+    Isso reduz BAD_JSON por truncamento: mesmo que corte, dá pra parsear.
+    """
     key = os.environ["GEMINI_API_KEY"]
 
     available = _list_models(key)
@@ -173,7 +103,13 @@ def gemini_generate_one(prompt: str) -> str:
     if not ranked:
         raise RuntimeError("No allowed text generateContent models available for this API key.")
 
-    payload = _make_payload(prompt)
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 650,  # deixa espaço pra "fechar" tudo
+        },
+    }
 
     attempts_per_model = 2
     base_delay = 2.0
@@ -210,9 +146,9 @@ def gemini_generate_one(prompt: str) -> str:
 
                 r.raise_for_status()
                 data = r.json()
-                return _extract_json_text(data)
+                return _extract_text(data)
 
-            except (requests.RequestException, ValueError, KeyError, IndexError) as e:
+            except (requests.RequestException, KeyError) as e:
                 last_err = f"{type(e).__name__}: {e} on {model}"
                 print(f"{last_err}. Retry {attempt}/{attempts_per_model}")
                 _sleep_backoff(base_delay, attempt, {})
