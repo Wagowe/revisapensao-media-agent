@@ -137,12 +137,43 @@ def main():
 
     prompt = make_master_prompt(objective, calendar_rows, swipe_rows, perf_rows)
 
-    try:
+   try:
+    ideas = None
+    last_parse_err = None
+
+    # tenta até 2 vezes: se vier JSON inválido, tenta de novo (pode cair em outro modelo)
+    for _ in range(2):
         raw = gemini_generate(prompt)
-        ideas = _safe_json_loads(raw)
-    except Exception as e:
-        msg = str(e)
-        print(f"LLM failed. Error: {msg}")
+        try:
+            ideas = _safe_json_loads(raw)
+            last_parse_err = None
+            break
+        except json.JSONDecodeError as je:
+            last_parse_err = f"BAD_JSON: {je}"
+            print(f"Got invalid JSON from model. Retrying once. Error: {je}")
+
+    if ideas is None:
+        raise RuntimeError(last_parse_err or "BAD_JSON: unknown parse error")
+
+except Exception as e:
+    msg = str(e)
+    print(f"LLM failed. Error: {msg}")
+
+    # ✅ Mock apenas para 429 e sem duplicar no mesmo dia
+    if "HTTP 429" in msg or " 429 " in msg or "429" in msg:
+        if has_status_today("mock"):
+            print("Already wrote MOCK today. Skipping duplicate mock.")
+            return
+        _write_mock_rows(spreadsheet_id, objective, f"fallback_mock_due_to_429: {msg}")
+        return
+
+    # ✅ Blocked: evita duplicar também
+    if has_status_today("blocked"):
+        print("Already wrote BLOCKED today. Skipping duplicate blocked.")
+        return
+
+    _write_blocked_row(spreadsheet_id, objective, msg)
+    return
 
         # ✅ Mock apenas para 429 e sem duplicar no mesmo dia
         if "HTTP 429" in msg or " 429 " in msg or "429" in msg:
