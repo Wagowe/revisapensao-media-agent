@@ -35,68 +35,58 @@ def _write_blocked_row(spreadsheet_id: str, objective: str, error_msg: str):
     append_rows(spreadsheet_id, "calendar", [row])
 
 
-def _write_mock_rows(spreadsheet_id: str, objective: str, note: str):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+def _mock_idea(ts: str, objective: str, note: str, variant: int):
     note = _sanitize_err(note)
-
-    rows = [
-        [
+    if variant == 1:
+        return [
             ts, objective, "educacao", "reels",
             "MOCK: revisão da pensão em 15s",
             "Seu INSS cortou 40% da pensão?",
             "Você pode ter direito ao recálculo.",
-            "Roteiro (MOCK): 1) Mostre o erro comum (pós EC 2019). "
-            "2) Diga quem se encaixa (dependente inválido/PCD). "
-            "3) CTA: triagem gratuita + WhatsApp.",
+            "Roteiro (MOCK): 1) Erro comum pós-EC 2019. 2) Quem tem direito (PCD/inválido). 3) CTA triagem.",
             "Cortaram 40%? Pode estar errado.",
-            "Legenda (MOCK): Se o dependente é inválido/PCD, o INSS pode ter calculado errado. "
-            "Faça a triagem gratuita e entenda seu caso.",
+            "Legenda (MOCK): Triagem gratuita e explicação rápida.",
             "Triagem gratuita no link.",
-            "Assets: card simples + ícones (sem logos)",
+            "Assets: card simples + ícones",
             "mock",
             note,
-        ],
-        [
+        ]
+    if variant == 2:
+        return [
             ts, objective, "prova_social", "carousel",
             "MOCK: antes/depois do recálculo",
-            "Olha o antes/depois",
-            "Caso real: valor pode subir bastante.",
-            "Roteiro (MOCK): Slide 1 promessa, 2 contexto, 3 erro do INSS, "
-            "4 tese/como corrigir, 5 CTA triagem.",
+            "Antes x Depois",
+            "Um erro pode reduzir muito o valor.",
+            "Roteiro (MOCK): 5 slides: promessa, contexto, erro, tese, CTA.",
             "ANTES x DEPOIS",
-            "Legenda (MOCK): Mostre o contraste e convide para triagem. "
-            "Se você tem pensão com dependente inválido/PCD, vale revisar.",
+            "Legenda (MOCK): Conte o caso e convide pra triagem.",
             "Agende a consulta.",
-            "Assets: gráfico simples + print borrado",
+            "Assets: gráfico simples",
             "mock",
             note,
-        ],
-        [
-            ts, objective, "triagem", "stories",
-            "MOCK: triagem gratuita em 30s",
-            "Quer saber se seu caso é forte?",
-            "Responda 6 perguntas.",
-            "Roteiro (MOCK): Story 1 promessa, Story 2 quem se encaixa, "
-            "Story 3 CTA com link/WhatsApp.",
-            "Triagem grátis",
-            "Legenda (MOCK): Triagem gratuita → envia documentos → consulta.",
-            "Arraste/Link na bio.",
-            "Assets: 3 cards minimalistas",
-            "mock",
-            note,
-        ],
+        ]
+    return [
+        ts, objective, "triagem", "stories",
+        "MOCK: triagem gratuita em 30s",
+        "Quer saber se seu caso é forte?",
+        "Responda 6 perguntas.",
+        "Roteiro (MOCK): 3 stories com CTA.",
+        "Triagem grátis",
+        "Legenda (MOCK): Triagem → docs → consulta.",
+        "Chame no WhatsApp.",
+        "Assets: 3 cards",
+        "mock",
+        note,
     ]
-
-    append_rows(spreadsheet_id, "calendar", rows)
 
 
 def main():
     spreadsheet_id = os.environ["GSHEETS_SPREADSHEET_ID"]
     objective = os.getenv("DEFAULT_OBJECTIVE", "balanced").lower()
 
-    calendar_rows, swipe_rows, perf_rows = build_context(spreadsheet_id, n=250)
+    # ✅ IMPORTANTÍSSIMO: reduz contexto para não explodir o prompt
+    calendar_rows, swipe_rows, perf_rows = build_context(spreadsheet_id, n=30)
 
-    # Gate diário (data) vs escrita (timestamp)
     today = datetime.now().strftime("%Y-%m-%d")
 
     def row_status(r):
@@ -111,7 +101,7 @@ def main():
             for r in calendar_rows
         )
 
-    # ✅ Se já tem draft hoje, não gera de novo
+    # ✅ Gate: se já tem draft hoje, não gera de novo
     already_drafted_today = any(
         len(r) > 12 and row_date_prefix(r) == today and row_status(r) == "draft"
         for r in calendar_rows
@@ -122,44 +112,82 @@ def main():
 
     base_prompt = make_master_prompt(objective, calendar_rows, swipe_rows, perf_rows)
 
-    # Vamos pedir 1 ideia por vez (3 chamadas pequenas => sem truncar)
+    # ✅ Corta o prompt em caracteres para evitar truncamento/instabilidade
+    # (ajuste fino: 8000 é bem conservador)
+    base_prompt = base_prompt[:8000]
+
+    # Regras de concisão por campo (isso reduz chance de truncar)
+    constraints = (
+        "\n\nREGRAS DE SAÍDA (OBRIGATÓRIO):\n"
+        "- Responda SOMENTE com um objeto JSON válido (sem markdown).\n"
+        "- Limites: pillar<=20c, format<=15c, idea_title<=80c, hook<=90c, hook_alt<=90c,\n"
+        "  on_screen_text<=90c, cta<=80c, assets_needed<=120c.\n"
+        "- script<=500c e caption<=450c. Use frases curtas.\n"
+        "- Não use aspas não-fechadas. Não inclua quebras estranhas.\n"
+    )
+
     ideas = []
-    try:
-        for i in range(1, 4):
-            per_prompt = (
-                base_prompt
-                + "\n\n"
-                + f"Agora gere APENAS 1 ideia (ideia #{i} de 3), como um OBJETO JSON seguindo o schema. "
-                  "Sem markdown, sem texto fora do JSON."
-            )
+    errors = []
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ✅ gerar 3 ideias; se falhar em alguma, completa com mock e segue
+    for i in range(1, 4):
+        per_prompt = (
+            base_prompt
+            + constraints
+            + f"\nGere APENAS 1 ideia (#{i}/3) agora."
+        )
+        try:
             raw = gemini_generate_one(per_prompt)
             idea = json.loads(raw)
             ideas.append(idea)
+        except Exception as e:
+            msg = str(e)
+            errors.append(msg)
 
-    except Exception as e:
-        msg = str(e)
-        print(f"LLM failed. Error: {msg}")
-
-        # ✅ Mock apenas para 429, sem duplicar
-        if "HTTP 429" in msg or " 429 " in msg or "429" in msg:
-            if has_status_today("mock"):
-                print("Already wrote MOCK today. Skipping duplicate mock.")
+            # Se 429: não duplica mocks no dia
+            if ("HTTP 429" in msg or " 429 " in msg or "429" in msg):
+                if has_status_today("mock"):
+                    print("Already wrote MOCK today. Skipping duplicate mock.")
+                    return
+                # completa as 3 com mock e escreve de uma vez
+                rows = [
+                    _mock_idea(ts, objective, f"fallback_mock_due_to_429: {msg}", 1),
+                    _mock_idea(ts, objective, f"fallback_mock_due_to_429: {msg}", 2),
+                    _mock_idea(ts, objective, f"fallback_mock_due_to_429: {msg}", 3),
+                ]
+                append_rows(spreadsheet_id, "calendar", rows)
                 return
-            _write_mock_rows(spreadsheet_id, objective, f"fallback_mock_due_to_429: {msg}")
-            return
 
-        # ✅ Blocked: sem duplicar
-        if has_status_today("blocked"):
-            print("Already wrote BLOCKED today. Skipping duplicate blocked.")
-            return
+            # Para BAD_JSON/400/503 etc: coloca mock só para aquela ideia e continua
+            print(f"Idea #{i} failed, using MOCK for this slot. Error: {msg}")
+            ideas.append({
+                "pillar": "system",
+                "format": "n/a",
+                "idea_title": f"MOCK slot #{i} (LLM falhou)",
+                "hook": "—",
+                "hook_alt": "—",
+                "script": f"Falha ao gerar via LLM. Motivo: {_sanitize_err(msg)}",
+                "on_screen_text": "—",
+                "caption": "Sem conteúdo gerado para este slot.",
+                "cta": "Tentar novamente mais tarde.",
+                "assets_needed": "Nenhum",
+                "_status_override": "mock",
+                "_notes": _sanitize_err(msg),
+            })
 
-        _write_blocked_row(spreadsheet_id, objective, msg)
+    # Se tudo falhou e já tem blocked hoje, não duplica
+    if all((it.get("format") == "n/a") for it in ideas) and has_status_today("blocked"):
+        print("All ideas failed and BLOCKED already exists today. Skipping duplicate blocked.")
         return
 
-    # ---- escrever drafts ----
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # ---- escrever linhas no calendar ----
     rows = []
-    for item in ideas:
+    for item in ideas[:3]:
+        status = item.get("_status_override", "draft")
+        notes = item.get("_notes", "")
+
         rows.append([
             ts,
             objective,
@@ -173,11 +201,19 @@ def main():
             item.get("caption", ""),
             item.get("cta", ""),
             item.get("assets_needed", ""),
-            "draft",
-            "",
+            status,
+            notes,
         ])
 
     append_rows(spreadsheet_id, "calendar", rows)
+
+    # Se houve erros, registra um blocked resumido (uma vez ao dia) só para auditoria
+    if errors and not has_status_today("blocked"):
+        _write_blocked_row(
+            spreadsheet_id,
+            objective,
+            " | ".join(_sanitize_err(e) for e in errors[:3])
+        )
 
 
 if __name__ == "__main__":
