@@ -1,41 +1,31 @@
 import os
-import json
 from datetime import datetime
 
 from agent.context import build_context
-from agent.llm import gemini_generate_one
+from agent.llm import gemini_generate_kv
 from agent.sheets import append_rows
 from agent.prompts_dynamic import make_master_prompt
+
+
+FIELDS = [
+    "pillar",
+    "format",
+    "idea_title",
+    "hook",
+    "hook_alt",
+    "script",
+    "on_screen_text",
+    "caption",
+    "cta",
+    "assets_needed",
+]
 
 
 def _sanitize_err(msg: str) -> str:
     return (msg or "").replace("key=", "key=REDACTED")[:400]
 
 
-def _write_blocked_row(spreadsheet_id: str, objective: str, error_msg: str):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    short_err = _sanitize_err(error_msg)
-
-    row = [
-        ts,
-        objective,
-        "system",
-        "n/a",
-        "LLM indisponível hoje",
-        "—",
-        "—",
-        f"Falhou ao gerar conteúdo via Gemini. Motivo: {short_err}",
-        "—",
-        "Sem conteúdo gerado hoje.",
-        "Tentar novamente mais tarde.",
-        "Nenhum",
-        "blocked",
-        short_err,
-    ]
-    append_rows(spreadsheet_id, "calendar", [row])
-
-
-def _mock_idea(ts: str, objective: str, note: str, variant: int):
+def _mock_row(ts: str, objective: str, variant: int, note: str):
     note = _sanitize_err(note)
     if variant == 1:
         return [
@@ -80,14 +70,40 @@ def _mock_idea(ts: str, objective: str, note: str, variant: int):
     ]
 
 
+def _parse_kv(text: str) -> dict:
+    """
+    Esperado: 10 linhas no formato key=value.
+    Se truncar, pega o que existir e deixa o resto vazio.
+    """
+    out = {k: "" for k in FIELDS}
+    if not text:
+        return out
+
+    # remove cercas markdown se vierem
+    t = text.replace("```", "").strip()
+
+    for line in t.splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if k in out:
+            out[k] = v
+
+    return out
+
+
 def main():
     spreadsheet_id = os.environ["GSHEETS_SPREADSHEET_ID"]
     objective = os.getenv("DEFAULT_OBJECTIVE", "balanced").lower()
 
-    # ✅ IMPORTANTÍSSIMO: reduz contexto para não explodir o prompt
+    # contexto curto para não inflar prompt
     calendar_rows, swipe_rows, perf_rows = build_context(spreadsheet_id, n=30)
 
     today = datetime.now().strftime("%Y-%m-%d")
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def row_status(r):
         return r[12] if len(r) > 12 else ""
@@ -101,119 +117,100 @@ def main():
             for r in calendar_rows
         )
 
-    # ✅ Gate: se já tem draft hoje, não gera de novo
-    already_drafted_today = any(
-        len(r) > 12 and row_date_prefix(r) == today and row_status(r) == "draft"
-        for r in calendar_rows
-    )
-    if already_drafted_today:
-        print("Already generated drafts today. Skipping Gemini call.")
+    # Gate: se já tem draft hoje, não roda de novo
+    if any(len(r) > 12 and row_date_prefix(r) == today and row_status(r) == "draft" for r in calendar_rows):
+        print("Already generated drafts today. Skipping LLM call.")
         return
 
     base_prompt = make_master_prompt(objective, calendar_rows, swipe_rows, perf_rows)
+    base_prompt = base_prompt[:6500]  # corta hard
 
-    # ✅ Corta o prompt em caracteres para evitar truncamento/instabilidade
-    # (ajuste fino: 8000 é bem conservador)
-    base_prompt = base_prompt[:8000]
-
-    # Regras de concisão por campo (isso reduz chance de truncar)
-    constraints = (
-        "\n\nREGRAS DE SAÍDA (OBRIGATÓRIO):\n"
-        "- Responda SOMENTE com um objeto JSON válido (sem markdown).\n"
-        "- Limites: pillar<=20c, format<=15c, idea_title<=80c, hook<=90c, hook_alt<=90c,\n"
-        "  on_screen_text<=90c, cta<=80c, assets_needed<=120c.\n"
-        "- script<=500c e caption<=450c. Use frases curtas.\n"
-        "- Não use aspas não-fechadas. Não inclua quebras estranhas.\n"
+    # template ultra rígido e curto
+    template = (
+        "\n\nRETORNE EXATAMENTE 10 LINHAS no formato key=value, sem markdown, sem texto extra.\n"
+        "As keys são EXATAMENTE:\n"
+        "pillar, format, idea_title, hook, hook_alt, script, on_screen_text, caption, cta, assets_needed\n"
+        "Regras: script <= 400 caracteres; caption <= 350; demais campos curtos.\n"
+        "Não use aspas obrigatoriamente; apenas key=value.\n"
     )
 
-    ideas = []
+    rows_to_write = []
+    any_real_draft = False
     errors = []
 
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # ✅ gerar 3 ideias; se falhar em alguma, completa com mock e segue
     for i in range(1, 4):
-        per_prompt = (
-            base_prompt
-            + constraints
-            + f"\nGere APENAS 1 ideia (#{i}/3) agora."
-        )
+        prompt = base_prompt + template + f"\nGere agora a ideia #{i}/3."
         try:
-            raw = gemini_generate_one(per_prompt)
-            idea = json.loads(raw)
-            ideas.append(idea)
+            txt = gemini_generate_kv(prompt)
+            data = _parse_kv(txt)
+
+            # se veio quase tudo vazio, considera falha
+            filled = sum(1 for k in FIELDS if (data.get(k) or "").strip())
+            if filled < 4:
+                raise RuntimeError(f"LOW_SIGNAL_OUTPUT: only {filled} fields filled")
+
+            row = [
+                ts,
+                objective,
+                data.get("pillar", ""),
+                data.get("format", ""),
+                data.get("idea_title", ""),
+                data.get("hook", ""),
+                data.get("hook_alt", ""),
+                data.get("script", ""),
+                data.get("on_screen_text", ""),
+                data.get("caption", ""),
+                data.get("cta", ""),
+                data.get("assets_needed", ""),
+                "draft",
+                "",
+            ]
+            rows_to_write.append(row)
+            any_real_draft = True
+
         except Exception as e:
             msg = str(e)
             errors.append(msg)
 
-            # Se 429: não duplica mocks no dia
+            # Se 429: escreve 3 mocks (uma vez no dia) e sai
             if ("HTTP 429" in msg or " 429 " in msg or "429" in msg):
                 if has_status_today("mock"):
                     print("Already wrote MOCK today. Skipping duplicate mock.")
                     return
-                # completa as 3 com mock e escreve de uma vez
                 rows = [
-                    _mock_idea(ts, objective, f"fallback_mock_due_to_429: {msg}", 1),
-                    _mock_idea(ts, objective, f"fallback_mock_due_to_429: {msg}", 2),
-                    _mock_idea(ts, objective, f"fallback_mock_due_to_429: {msg}", 3),
+                    _mock_row(ts, objective, 1, f"fallback_mock_due_to_429: {msg}"),
+                    _mock_row(ts, objective, 2, f"fallback_mock_due_to_429: {msg}"),
+                    _mock_row(ts, objective, 3, f"fallback_mock_due_to_429: {msg}"),
                 ]
                 append_rows(spreadsheet_id, "calendar", rows)
                 return
 
-            # Para BAD_JSON/400/503 etc: coloca mock só para aquela ideia e continua
-            print(f"Idea #{i} failed, using MOCK for this slot. Error: {msg}")
-            ideas.append({
-                "pillar": "system",
-                "format": "n/a",
-                "idea_title": f"MOCK slot #{i} (LLM falhou)",
-                "hook": "—",
-                "hook_alt": "—",
-                "script": f"Falha ao gerar via LLM. Motivo: {_sanitize_err(msg)}",
-                "on_screen_text": "—",
-                "caption": "Sem conteúdo gerado para este slot.",
-                "cta": "Tentar novamente mais tarde.",
-                "assets_needed": "Nenhum",
-                "_status_override": "mock",
-                "_notes": _sanitize_err(msg),
-            })
+            # erro não-429: mock só para este slot e continua
+            rows_to_write.append(_mock_row(ts, objective, i, msg))
 
-    # Se tudo falhou e já tem blocked hoje, não duplica
-    if all((it.get("format") == "n/a") for it in ideas) and has_status_today("blocked"):
-        print("All ideas failed and BLOCKED already exists today. Skipping duplicate blocked.")
-        return
+    # ✅ Sempre escreve 3 linhas (draft ou mock)
+    append_rows(spreadsheet_id, "calendar", rows_to_write[:3])
 
-    # ---- escrever linhas no calendar ----
-    rows = []
-    for item in ideas[:3]:
-        status = item.get("_status_override", "draft")
-        notes = item.get("_notes", "")
-
-        rows.append([
+    # Opcional: registrar blocked (uma vez ao dia) se NENHUM draft real saiu
+    if (not any_real_draft) and (not has_status_today("blocked")):
+        blocked_note = " | ".join(_sanitize_err(e) for e in errors[:3]) or "LLM failed"
+        row = [
             ts,
             objective,
-            item.get("pillar", ""),
-            item.get("format", ""),
-            item.get("idea_title", ""),
-            item.get("hook", ""),
-            item.get("hook_alt", ""),
-            item.get("script", ""),
-            item.get("on_screen_text", ""),
-            item.get("caption", ""),
-            item.get("cta", ""),
-            item.get("assets_needed", ""),
-            status,
-            notes,
-        ])
-
-    append_rows(spreadsheet_id, "calendar", rows)
-
-    # Se houve erros, registra um blocked resumido (uma vez ao dia) só para auditoria
-    if errors and not has_status_today("blocked"):
-        _write_blocked_row(
-            spreadsheet_id,
-            objective,
-            " | ".join(_sanitize_err(e) for e in errors[:3])
-        )
+            "system",
+            "n/a",
+            "LLM indisponível hoje",
+            "—",
+            "—",
+            f"Falhou ao gerar conteúdo via Gemini. Motivo: {blocked_note}",
+            "—",
+            "Sem conteúdo gerado hoje.",
+            "Tentar novamente mais tarde.",
+            "Nenhum",
+            "blocked",
+            blocked_note,
+        ]
+        append_rows(spreadsheet_id, "calendar", [row])
 
 
 if __name__ == "__main__":
