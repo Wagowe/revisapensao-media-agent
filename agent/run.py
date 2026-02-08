@@ -3,23 +3,9 @@ import json
 from datetime import datetime
 
 from agent.context import build_context
-from agent.llm import gemini_generate
+from agent.llm import gemini_generate_one
 from agent.sheets import append_rows
 from agent.prompts_dynamic import make_master_prompt
-
-
-def _safe_json_loads(text: str):
-    s = (text or "").strip()
-
-    if s.startswith("```"):
-        s = s.replace("```json", "").replace("```", "").strip()
-
-    start = s.find("[")
-    end = s.rfind("]")
-    if start != -1 and end != -1 and end > start:
-        s = s[start:end + 1]
-
-    return json.loads(s)
 
 
 def _sanitize_err(msg: str) -> str:
@@ -134,31 +120,27 @@ def main():
         print("Already generated drafts today. Skipping Gemini call.")
         return
 
-    prompt = make_master_prompt(objective, calendar_rows, swipe_rows, perf_rows)
+    base_prompt = make_master_prompt(objective, calendar_rows, swipe_rows, perf_rows)
 
-    # ---- chamada do LLM + parse com retry em caso de JSON inválido ----
+    # Vamos pedir 1 ideia por vez (3 chamadas pequenas => sem truncar)
+    ideas = []
     try:
-        ideas = None
-        last_parse_err = None
-
-        for _ in range(2):  # tenta 2 vezes no total
-            raw = gemini_generate(prompt)
-            try:
-                ideas = _safe_json_loads(raw)
-                last_parse_err = None
-                break
-            except json.JSONDecodeError as je:
-                last_parse_err = f"BAD_JSON: {je}"
-                print(f"Got invalid JSON from model. Retrying once. Error: {je}")
-
-        if ideas is None:
-            raise RuntimeError(last_parse_err or "BAD_JSON: unknown parse error")
+        for i in range(1, 4):
+            per_prompt = (
+                base_prompt
+                + "\n\n"
+                + f"Agora gere APENAS 1 ideia (ideia #{i} de 3), como um OBJETO JSON seguindo o schema. "
+                  "Sem markdown, sem texto fora do JSON."
+            )
+            raw = gemini_generate_one(per_prompt)
+            idea = json.loads(raw)
+            ideas.append(idea)
 
     except Exception as e:
         msg = str(e)
         print(f"LLM failed. Error: {msg}")
 
-        # ✅ Mock apenas para 429, e sem duplicar no mesmo dia
+        # ✅ Mock apenas para 429, sem duplicar
         if "HTTP 429" in msg or " 429 " in msg or "429" in msg:
             if has_status_today("mock"):
                 print("Already wrote MOCK today. Skipping duplicate mock.")
@@ -166,7 +148,7 @@ def main():
             _write_mock_rows(spreadsheet_id, objective, f"fallback_mock_due_to_429: {msg}")
             return
 
-        # ✅ Blocked: sem duplicar no mesmo dia
+        # ✅ Blocked: sem duplicar
         if has_status_today("blocked"):
             print("Already wrote BLOCKED today. Skipping duplicate blocked.")
             return
@@ -177,7 +159,7 @@ def main():
     # ---- escrever drafts ----
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = []
-    for item in ideas[:3]:
+    for item in ideas:
         rows.append([
             ts,
             objective,
