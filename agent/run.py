@@ -109,15 +109,26 @@ def main():
     objective = os.getenv("DEFAULT_OBJECTIVE", "balanced").lower()
 
     calendar_rows, swipe_rows, perf_rows = build_context(spreadsheet_id, n=250)
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # "today" para gate (data apenas); "ts" para escrita (data+hora)
+    today = datetime.now().strftime("%Y-%m-%d")
 
     def row_status(r):
         return r[12] if len(r) > 12 else ""
 
+    def row_date_prefix(r):
+        return str(r[0])[:10] if len(r) > 0 else ""
+
+    def has_status_today(status: str) -> bool:
+        return any(
+            len(r) > 12 and row_date_prefix(r) == today and str(r[12]).strip() == status
+            for r in calendar_rows
+        )
+
     # ✅ Gate: se já tem DRAFT hoje, não gera de novo.
     # (blocked/mock não bloqueiam — você pode tentar de novo mais tarde)
     already_drafted_today = any(
-        len(r) > 0 and r[0] == ts and row_status(r) == "draft"
+        len(r) > 12 and row_date_prefix(r) == today and row_status(r) == "draft"
         for r in calendar_rows
     )
     if already_drafted_today:
@@ -133,14 +144,23 @@ def main():
         msg = str(e)
         print(f"LLM failed. Error: {msg}")
 
-        # ✅ Mock apenas para 429
+        # ✅ Mock apenas para 429 e sem duplicar no mesmo dia
         if "HTTP 429" in msg or " 429 " in msg or "429" in msg:
+            if has_status_today("mock"):
+                print("Already wrote MOCK today. Skipping duplicate mock.")
+                return
             _write_mock_rows(spreadsheet_id, objective, f"fallback_mock_due_to_429: {msg}")
+            return
+
+        # ✅ Blocked: evita duplicar também (opcional, mas útil)
+        if has_status_today("blocked"):
+            print("Already wrote BLOCKED today. Skipping duplicate blocked.")
             return
 
         _write_blocked_row(spreadsheet_id, objective, msg)
         return
 
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = []
     for item in ideas[:3]:
         rows.append([
