@@ -71,15 +71,10 @@ def _mock_row(ts: str, objective: str, variant: int, note: str):
 
 
 def _parse_kv(text: str) -> dict:
-    """
-    Esperado: 10 linhas no formato key=value.
-    Se truncar, pega o que existir e deixa o resto vazio.
-    """
     out = {k: "" for k in FIELDS}
     if not text:
         return out
 
-    # remove cercas markdown se vierem
     t = text.replace("```", "").strip()
 
     for line in t.splitlines():
@@ -95,11 +90,15 @@ def _parse_kv(text: str) -> dict:
     return out
 
 
+def _filled_fields_count(d: dict) -> int:
+    return sum(1 for k in FIELDS if (d.get(k) or "").strip())
+
+
 def main():
     spreadsheet_id = os.environ["GSHEETS_SPREADSHEET_ID"]
     objective = os.getenv("DEFAULT_OBJECTIVE", "balanced").lower()
 
-    # contexto curto para não inflar prompt
+    # Contexto curto para não inflar prompt
     calendar_rows, swipe_rows, perf_rows = build_context(spreadsheet_id, n=30)
 
     today = datetime.now().strftime("%Y-%m-%d")
@@ -125,27 +124,38 @@ def main():
     base_prompt = make_master_prompt(objective, calendar_rows, swipe_rows, perf_rows)
     base_prompt = base_prompt[:6500]  # corta hard
 
-    # template ultra rígido e curto
     template = (
         "\n\nRETORNE EXATAMENTE 10 LINHAS no formato key=value, sem markdown, sem texto extra.\n"
         "As keys são EXATAMENTE:\n"
         "pillar, format, idea_title, hook, hook_alt, script, on_screen_text, caption, cta, assets_needed\n"
         "Regras: script <= 400 caracteres; caption <= 350; demais campos curtos.\n"
-        "Não use aspas obrigatoriamente; apenas key=value.\n"
+        "Não escreva nada além das 10 linhas.\n"
     )
 
     rows_to_write = []
     any_real_draft = False
     errors = []
 
-    for i in range(1, 4):
-        prompt = base_prompt + template + f"\nGere agora a ideia #{i}/3."
-        try:
-            txt = gemini_generate_kv(prompt)
-            data = _parse_kv(txt)
+    def gen_one(slot_i: int, attempt_i: int) -> dict:
+        # attempt_i usado só para orientar o modelo (segunda chance)
+        extra = ""
+        if attempt_i == 2:
+            extra = (
+                "\nATENÇÃO: Na tentativa anterior você não preencheu todos os campos. "
+                "Agora preencha TODAS as 10 linhas obrigatoriamente.\n"
+            )
+        prompt = base_prompt + template + extra + f"\nGere agora a ideia #{slot_i}/3."
+        txt = gemini_generate_kv(prompt)
+        data = _parse_kv(txt)
+        return data
 
-            # se veio quase tudo vazio, considera falha
-            filled = sum(1 for k in FIELDS if (data.get(k) or "").strip())
+    for slot_i in range(1, 4):
+        try:
+            # 1ª tentativa
+            data = gen_one(slot_i, attempt_i=1)
+            filled = _filled_fields_count(data)
+
+            # Se veio fraco, tenta mais uma vez (uma única vez)
             if filled < 4:
                 raise RuntimeError(f"LOW_SIGNAL_OUTPUT: only {filled} fields filled")
 
@@ -168,50 +178,26 @@ def main():
             rows_to_write.append(row)
             any_real_draft = True
 
-        except Exception as e:
-            msg = str(e)
-            errors.append(msg)
+        except Exception as e1:
+            msg1 = str(e1)
+            errors.append(msg1)
 
-            # Se 429: escreve 3 mocks (uma vez no dia) e sai
-            if ("HTTP 429" in msg or " 429 " in msg or "429" in msg):
+            # 429: escreve 3 mocks (uma vez no dia) e sai
+            if ("HTTP 429" in msg1 or " 429 " in msg1 or "429" in msg1):
                 if has_status_today("mock"):
                     print("Already wrote MOCK today. Skipping duplicate mock.")
                     return
                 rows = [
-                    _mock_row(ts, objective, 1, f"fallback_mock_due_to_429: {msg}"),
-                    _mock_row(ts, objective, 2, f"fallback_mock_due_to_429: {msg}"),
-                    _mock_row(ts, objective, 3, f"fallback_mock_due_to_429: {msg}"),
+                    _mock_row(ts, objective, 1, f"fallback_mock_due_to_429: {msg1}"),
+                    _mock_row(ts, objective, 2, f"fallback_mock_due_to_429: {msg1}"),
+                    _mock_row(ts, objective, 3, f"fallback_mock_due_to_429: {msg1}"),
                 ]
                 append_rows(spreadsheet_id, "calendar", rows)
                 return
 
-            # erro não-429: mock só para este slot e continua
-            rows_to_write.append(_mock_row(ts, objective, i, msg))
-
-    # ✅ Sempre escreve 3 linhas (draft ou mock)
-    append_rows(spreadsheet_id, "calendar", rows_to_write[:3])
-
-    # Opcional: registrar blocked (uma vez ao dia) se NENHUM draft real saiu
-    if (not any_real_draft) and (not has_status_today("blocked")):
-        blocked_note = " | ".join(_sanitize_err(e) for e in errors[:3]) or "LLM failed"
-        row = [
-            ts,
-            objective,
-            "system",
-            "n/a",
-            "LLM indisponível hoje",
-            "—",
-            "—",
-            f"Falhou ao gerar conteúdo via Gemini. Motivo: {blocked_note}",
-            "—",
-            "Sem conteúdo gerado hoje.",
-            "Tentar novamente mais tarde.",
-            "Nenhum",
-            "blocked",
-            blocked_note,
-        ]
-        append_rows(spreadsheet_id, "calendar", [row])
-
-
-if __name__ == "__main__":
-    main()
+            # ✅ Retry extra (somente para este slot)
+            try:
+                data2 = gen_one(slot_i, attempt_i=2)
+                filled2 = _filled_fields_count(data2)
+                if filled2 < 4:
+                    raise RuntimeError(f"LOW_SIGNAL_O
