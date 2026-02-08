@@ -7,8 +7,7 @@ import requests
 BASE = "https://generativelanguage.googleapis.com/v1beta"
 RETRY_STATUS = {429, 500, 502, 503, 504}
 
-# Só modelos "texto" que normalmente suportam generateContent.
-# (A lista final é filtrada pelo ListModels também)
+# Preferência de modelos de texto
 PREFERRED = [
     "models/gemini-2.5-flash-lite",
     "models/gemini-2.0-flash-lite",
@@ -18,7 +17,24 @@ PREFERRED = [
     "models/gemini-2.5-pro",
 ]
 
-# Schema agora é UM OBJETO (1 ideia), muito menor => menos truncamento
+# Excluir qualquer coisa que não seja "texto padrão"
+EXCLUDE_SUBSTRINGS = [
+    "tts",
+    "audio",
+    "image",
+    "vision",
+    "embedding",
+    "robotics",
+    "computer-use",
+    "deep-research",
+    "imagen",
+    "veo",
+    "gemma",
+    "nano",
+    "aqa",
+]
+
+# Schema de 1 ideia (objeto)
 IDEA_SCHEMA = {
     "type": "object",
     "required": [
@@ -49,10 +65,25 @@ IDEA_SCHEMA = {
 }
 
 
+def _is_allowed_text_model(name: str) -> bool:
+    n = (name or "").lower()
+    if "gemini" not in n:
+        return False
+    # precisa ser flash/pro (texto)
+    if ("flash" not in n) and ("pro" not in n):
+        return False
+    for bad in EXCLUDE_SUBSTRINGS:
+        if bad in n:
+            return False
+    return True
+
+
 def _list_models(api_key: str) -> list[str]:
     """
-    Lista modelos e filtra para os que suportam generateContent.
-    Isso evita tentar TTS/embeddings/imagem etc.
+    Lista modelos e filtra:
+    - precisa suportar generateContent
+    - precisa parecer "Gemini texto"
+    - exclui previews/tts/audio/image/embeddings etc.
     """
     url = f"{BASE}/models?key={api_key}"
     r = requests.get(url, timeout=30)
@@ -64,28 +95,33 @@ def _list_models(api_key: str) -> list[str]:
     for m in models:
         name = m.get("name")
         methods = m.get("supportedGenerationMethods", []) or []
-        if name and "generateContent" in methods:
-            out.append(name)
+        if not name:
+            continue
+        if "generateContent" not in methods:
+            continue
+        if not _is_allowed_text_model(name):
+            continue
+        out.append(name)
+
     return out
 
 
 def _rank_models(available: list[str]) -> list[str]:
     avail_set = set(available)
     ranked = [m for m in PREFERRED if m in avail_set]
-    # Se houver outros "generateContent" além dos preferidos, ainda assim não quero tentar tudo.
-    # Mantemos só os preferidos + alguns extras (no máximo 5) para fallback.
     extras = [m for m in available if m not in ranked]
-    ranked += extras[:5]
+    # não tente uma lista enorme — isso só queima tempo e quota
+    ranked += extras[:3]
     return ranked
 
 
 def _make_payload(prompt: str) -> dict:
-    # baixa temperatura + tokens moderados = menos truncamento
+    # bem conservador: resposta curta e obediente
     return {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 500,
+            "temperature": 0.15,
+            "maxOutputTokens": 300,
             "response_mime_type": "application/json",
             "response_json_schema": IDEA_SCHEMA,
         },
@@ -104,25 +140,20 @@ def _sleep_backoff(base_delay: float, attempt: int, headers: dict):
 
 
 def _extract_json_text(data: dict) -> str:
-    """
-    Em JSON mode deveria vir um objeto JSON válido.
-    Mesmo assim, às vezes pode vir com lixo ao redor.
-    Tentamos validar e, se necessário, extrair o bloco { ... }.
-    """
     txt = data["candidates"][0]["content"]["parts"][0]["text"]
     if not isinstance(txt, str):
         raise ValueError("Model response text is not a string")
 
     s = txt.strip()
 
-    # tentativa direta
+    # direto
     try:
         json.loads(s)
         return s
     except Exception:
         pass
 
-    # tenta extrair objeto
+    # extrai objeto { ... }
     start = s.find("{")
     end = s.rfind("}")
     if start != -1 and end != -1 and end > start:
@@ -135,15 +166,12 @@ def _extract_json_text(data: dict) -> str:
 
 
 def gemini_generate_one(prompt: str) -> str:
-    """
-    Gera 1 ideia (um objeto JSON) e retorna como string JSON válida.
-    """
     key = os.environ["GEMINI_API_KEY"]
 
     available = _list_models(key)
     ranked = _rank_models(available)
     if not ranked:
-        raise RuntimeError("No generateContent models available for this API key.")
+        raise RuntimeError("No allowed text generateContent models available for this API key.")
 
     payload = _make_payload(prompt)
 
@@ -159,19 +187,16 @@ def gemini_generate_one(prompt: str) -> str:
             try:
                 r = requests.post(url, json=payload, timeout=90)
 
-                # 404: modelo não disponível → troca
                 if r.status_code == 404:
                     last_err = f"HTTP 404 on {model}"
                     print(f"{last_err} → switching model")
                     break
 
-                # 400: pode ser que esse modelo não aceite schema/json mode como esperado → troca
                 if r.status_code == 400:
                     last_err = f"HTTP 400 on {model}"
                     print(f"{last_err} → switching model")
                     break
 
-                # 429: rate limit → troca de modelo
                 if r.status_code == 429:
                     last_err = f"HTTP 429 on {model}"
                     print(f"{last_err} → switching model")
