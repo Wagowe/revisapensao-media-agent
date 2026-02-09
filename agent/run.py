@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import datetime
 
 from agent.context import build_context
@@ -19,6 +20,9 @@ FIELDS = [
     "cta",
     "assets_needed",
 ]
+
+# Threshold de similaridade (0 a 1). Quanto maior, mais rígido.
+SIMILARITY_THRESHOLD = 0.82
 
 
 def _sanitize_err(msg: str) -> str:
@@ -92,6 +96,73 @@ def _filled_fields_count(d: dict) -> int:
     return sum(1 for k in FIELDS if (d.get(k) or "").strip())
 
 
+def _normalize_text(s: str) -> str:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9à-ú\s]", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _token_set(s: str) -> set:
+    s = _normalize_text(s)
+    if not s:
+        return set()
+    return set(s.split(" "))
+
+
+def _jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    inter = len(a.intersection(b))
+    union = len(a.union(b))
+    return inter / union if union else 0.0
+
+
+def _idea_signature(d: dict) -> str:
+    # O que define “parecido” na prática
+    return " | ".join([
+        d.get("idea_title", ""),
+        d.get("hook", ""),
+        d.get("script", ""),
+    ])
+
+
+def _max_similarity(candidate: dict, accepted: list[dict]) -> float:
+    cand_set = _token_set(_idea_signature(candidate))
+    sims = []
+    for a in accepted:
+        a_set = _token_set(_idea_signature(a))
+        sims.append(_jaccard(cand_set, a_set))
+    return max(sims) if sims else 0.0
+
+
+def _avoid_block(accepted: list[dict]) -> str:
+    """
+    Passa para o modelo um resumo do que já foi gerado nesta execução,
+    para forçar variedade.
+    """
+    if not accepted:
+        return ""
+
+    lines = []
+    for idx, a in enumerate(accepted, start=1):
+        title = (a.get("idea_title") or "").strip()[:70]
+        hook = (a.get("hook") or "").strip()[:80]
+        fmt = (a.get("format") or "").strip()
+        pillar = (a.get("pillar") or "").strip()
+        lines.append(f"- Já usei #{idx}: pillar={pillar}, format={fmt}, title='{title}', hook='{hook}'")
+
+    return (
+        "\n\nDIVERSIDADE OBRIGATÓRIA:\n"
+        "Não repita nem parafraseie as ideias abaixo. Mude o ÂNGULO (ex.: erro do INSS x quem tem direito x documentos x prazo x mito/verdade).\n"
+        "Se as duas primeiras forem 'educacao/reels', a próxima deve ser OUTRO pillar e/ou OUTRO formato.\n"
+        + "\n".join(lines) +
+        "\n"
+    )
+
+
 def main():
     spreadsheet_id = os.environ["GSHEETS_SPREADSHEET_ID"]
     objective = os.getenv("DEFAULT_OBJECTIVE", "balanced").lower()
@@ -135,6 +206,7 @@ def main():
     )
 
     rows_to_write = []
+    accepted_ideas: list[dict] = []
     any_real_draft = False
     errors = []
 
@@ -142,19 +214,35 @@ def main():
         extra = ""
         if attempt_i == 2:
             extra = (
-                "\nATENÇÃO: Na tentativa anterior você não preencheu os campos. "
-                "Agora preencha TODAS as 10 linhas obrigatoriamente.\n"
+                "\nATENÇÃO: Na tentativa anterior, a saída veio incompleta ou parecida demais. "
+                "Agora preencha TODAS as 10 linhas e traga um ângulo claramente diferente.\n"
             )
-        prompt = base_prompt + template + extra + f"\nGere agora a ideia #{slot_i}/3."
+
+        avoid = _avoid_block(accepted_ideas)
+
+        prompt = (
+            base_prompt
+            + template
+            + avoid
+            + extra
+            + f"\nGere agora a ideia #{slot_i}/3."
+        )
+
         txt = gemini_generate_kv(prompt)
         return _parse_kv(txt)
 
     for slot_i in range(1, 4):
         try:
+            # 1ª tentativa
             data = gen_one(slot_i, attempt_i=1)
             filled = _filled_fields_count(data)
             if filled < 4:
                 raise RuntimeError(f"LOW_SIGNAL_OUTPUT: only {filled} fields filled")
+
+            # Checagem de diversidade
+            sim = _max_similarity(data, accepted_ideas)
+            if sim >= SIMILARITY_THRESHOLD:
+                raise RuntimeError(f"LOW_DIVERSITY: similarity={sim:.2f}")
 
             row = [
                 ts, objective,
@@ -172,6 +260,7 @@ def main():
                 "",
             ]
             rows_to_write.append(row)
+            accepted_ideas.append(data)
             any_real_draft = True
 
         except Exception as e1:
@@ -191,12 +280,18 @@ def main():
                 append_rows(spreadsheet_id, "calendar", rows)
                 return
 
-            # Retry extra (somente para este slot)
+            # Retry extra (somente para este slot) — também cobre LOW_DIVERSITY
             try:
                 data2 = gen_one(slot_i, attempt_i=2)
                 filled2 = _filled_fields_count(data2)
                 if filled2 < 4:
                     raise RuntimeError(f"LOW_SIGNAL_OUTPUT: only {filled2} fields filled (after retry)")
+
+                sim2 = _max_similarity(data2, accepted_ideas)
+                notes = ""
+                if sim2 >= SIMILARITY_THRESHOLD:
+                    # não travar; escreve, mas marca
+                    notes = f"low_diversity_after_retry similarity={sim2:.2f}"
 
                 row2 = [
                     ts, objective,
@@ -211,9 +306,10 @@ def main():
                     data2.get("cta", ""),
                     data2.get("assets_needed", ""),
                     "draft",
-                    "",
+                    notes,
                 ]
                 rows_to_write.append(row2)
+                accepted_ideas.append(data2)
                 any_real_draft = True
 
             except Exception as e2:
