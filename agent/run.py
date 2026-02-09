@@ -21,12 +21,21 @@ FIELDS = [
     "assets_needed",
 ]
 
-# Threshold de similaridade (0 a 1). Quanto maior, mais rígido.
 SIMILARITY_THRESHOLD = 0.82
 
 
 def _sanitize_err(msg: str) -> str:
     return (msg or "").replace("key=", "key=REDACTED")[:400]
+
+
+def _is_quota_or_rate_error(msg: str) -> bool:
+    """
+    Na prática, “acabou crédito/quota” aparece como:
+    - HTTP 429 (rate limit / quota)
+    - HTTP 403 (quota / permission / billing em alguns casos)
+    """
+    m = (msg or "").lower()
+    return ("http 429" in m) or (" 429 " in m) or ("http 403" in m) or (" 403 " in m)
 
 
 def _mock_row(ts: str, objective: str, variant: int, note: str):
@@ -121,7 +130,6 @@ def _jaccard(a: set, b: set) -> float:
 
 
 def _idea_signature(d: dict) -> str:
-    # O que define “parecido” na prática
     return " | ".join([
         d.get("idea_title", ""),
         d.get("hook", ""),
@@ -139,10 +147,6 @@ def _max_similarity(candidate: dict, accepted: list[dict]) -> float:
 
 
 def _avoid_block(accepted: list[dict]) -> str:
-    """
-    Passa para o modelo um resumo do que já foi gerado nesta execução,
-    para forçar variedade.
-    """
     if not accepted:
         return ""
 
@@ -156,8 +160,8 @@ def _avoid_block(accepted: list[dict]) -> str:
 
     return (
         "\n\nDIVERSIDADE OBRIGATÓRIA:\n"
-        "Não repita nem parafraseie as ideias abaixo. Mude o ÂNGULO (ex.: erro do INSS x quem tem direito x documentos x prazo x mito/verdade).\n"
-        "Se as duas primeiras forem 'educacao/reels', a próxima deve ser OUTRO pillar e/ou OUTRO formato.\n"
+        "Não repita nem parafraseie as ideias abaixo. Mude o ÂNGULO (ex.: quem tem direito x documentos x prazo x mito/verdade x erro específico).\n"
+        "Se duas primeiras forem iguais em pillar/format, a próxima deve mudar pelo menos UM dos dois.\n"
         + "\n".join(lines) +
         "\n"
     )
@@ -185,14 +189,11 @@ def main():
             for r in calendar_rows
         )
 
-    # Gate: se já tem draft hoje, não roda de novo
+    # ✅ MUDANÇA: NÃO faz mais skip só porque já tem draft hoje.
     already_drafted_today = any(
         len(r) > 12 and row_date_prefix(r) == today and row_status(r) == "draft"
         for r in calendar_rows
     )
-    if already_drafted_today:
-        print("Already generated drafts today. Skipping LLM call.")
-        return
 
     base_prompt = make_master_prompt(objective, calendar_rows, swipe_rows, perf_rows)
     base_prompt = base_prompt[:6500]
@@ -233,16 +234,16 @@ def main():
 
     for slot_i in range(1, 4):
         try:
-            # 1ª tentativa
             data = gen_one(slot_i, attempt_i=1)
             filled = _filled_fields_count(data)
             if filled < 4:
                 raise RuntimeError(f"LOW_SIGNAL_OUTPUT: only {filled} fields filled")
 
-            # Checagem de diversidade
             sim = _max_similarity(data, accepted_ideas)
             if sim >= SIMILARITY_THRESHOLD:
                 raise RuntimeError(f"LOW_DIVERSITY: similarity={sim:.2f}")
+
+            notes = "rerun_same_day" if already_drafted_today else ""
 
             row = [
                 ts, objective,
@@ -257,7 +258,7 @@ def main():
                 data.get("cta", ""),
                 data.get("assets_needed", ""),
                 "draft",
-                "",
+                notes,
             ]
             rows_to_write.append(row)
             accepted_ideas.append(data)
@@ -267,20 +268,20 @@ def main():
             msg1 = str(e1)
             errors.append(msg1)
 
-            # 429: escreve 3 mocks (uma vez no dia) e sai
-            if ("HTTP 429" in msg1 or " 429 " in msg1 or "429" in msg1):
+            # ✅ Só interrompe por “créditos/quota” (429/403)
+            if _is_quota_or_rate_error(msg1):
                 if has_status_today("mock"):
-                    print("Already wrote MOCK today. Skipping duplicate mock.")
+                    print("Quota/rate issue and MOCK already written today. Skipping duplicate mock.")
                     return
                 rows = [
-                    _mock_row(ts, objective, 1, f"fallback_mock_due_to_429: {msg1}"),
-                    _mock_row(ts, objective, 2, f"fallback_mock_due_to_429: {msg1}"),
-                    _mock_row(ts, objective, 3, f"fallback_mock_due_to_429: {msg1}"),
+                    _mock_row(ts, objective, 1, f"fallback_mock_due_to_quota: {msg1}"),
+                    _mock_row(ts, objective, 2, f"fallback_mock_due_to_quota: {msg1}"),
+                    _mock_row(ts, objective, 3, f"fallback_mock_due_to_quota: {msg1}"),
                 ]
                 append_rows(spreadsheet_id, "calendar", rows)
                 return
 
-            # Retry extra (somente para este slot) — também cobre LOW_DIVERSITY
+            # Retry extra (somente para este slot)
             try:
                 data2 = gen_one(slot_i, attempt_i=2)
                 filled2 = _filled_fields_count(data2)
@@ -288,10 +289,9 @@ def main():
                     raise RuntimeError(f"LOW_SIGNAL_OUTPUT: only {filled2} fields filled (after retry)")
 
                 sim2 = _max_similarity(data2, accepted_ideas)
-                notes = ""
+                notes2 = "rerun_same_day" if already_drafted_today else ""
                 if sim2 >= SIMILARITY_THRESHOLD:
-                    # não travar; escreve, mas marca
-                    notes = f"low_diversity_after_retry similarity={sim2:.2f}"
+                    notes2 = (notes2 + " " if notes2 else "") + f"low_diversity_after_retry similarity={sim2:.2f}"
 
                 row2 = [
                     ts, objective,
@@ -306,7 +306,7 @@ def main():
                     data2.get("cta", ""),
                     data2.get("assets_needed", ""),
                     "draft",
-                    notes,
+                    notes2,
                 ]
                 rows_to_write.append(row2)
                 accepted_ideas.append(data2)
